@@ -2,7 +2,7 @@
 # antidote: snapshot git state before a risky operation and write down the exact
 # commands that undo it. Every poison needs an antidote.
 #
-# https://github.com/marckengland/antidote (MIT License)
+# https://github.com/marckengland/antidote-skill (MIT License)
 #
 # shellcheck disable=SC2016 # backticks in printf formats are Markdown, not command substitution
 
