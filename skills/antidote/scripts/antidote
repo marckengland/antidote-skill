@@ -7,12 +7,14 @@
 # shellcheck disable=SC2016 # backticks in printf formats are Markdown, not command substitution
 
 set -euo pipefail
+# Literal "&" in ${var//pattern/replacement} (bash 5.2 would substitute the match).
+shopt -u patsub_replacement 2>/dev/null || true
 
 VERSION="0.1.0"
 PROG="antidote"
 DEFAULT_PROTECT="main master trunk develop release/* production prod"
 DEFAULT_PROTECT_TAG="*"
-OPS="push force-push merge rewrite delete-branch tag"
+OPS="push force-push merge rewrite delete-branch tag db"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -27,12 +29,15 @@ $PROG $VERSION: prepare an antidote before a risky git operation.
 Usage:
   $PROG prepare [--op OP] [--target REMOTE/BRANCH] [--head REV] [--note TEXT]
                 [--no-fetch] [--bundle]
-  $PROG verify  [ID] [--no-fetch]
+  $PROG prepare --op db (--db URL|FILE | --db-env VAR) [--out DIR] [--note TEXT]
+                [--no-migrations] [--engine E] [--dump-cmd C --restore-cmd C [--verify-cmd C] --name N]
+  $PROG verify  [ID] [--no-fetch] [--rehearse | --rehearse-into URL]
   $PROG show    [ID]
   $PROG list
   $PROG drop    ID
   $PROG prune   [--keep N]
   $PROG covers  --op OP [--branch B] (exit 0 if a fresh antidote exists, e.g. before a PR merge)
+  $PROG covers  --op db [--db-env VAR] (exit 0 if a database antidote is fresh, see antidote.dbMaxAge)
   $PROG guard   REMOTE [URL]        (run by the pre-push hook; reads refs on stdin)
   $PROG install-hook [--force]
 
@@ -43,6 +48,8 @@ Operations (--op):
   rewrite        local rebase / reset / amend / filter-repo (optionally then force-pushed)
   delete-branch  deleting --target on the remote
   tag            creating, moving or deleting the tag --target (REMOTE/TAG) on the remote
+  db             a database migration or data change: backs up the database first
+                 (postgres://, mysql://, a SQLite file, or any engine via --dump-cmd)
 
 prepare snapshots HEAD, the remote target branch and any uncommitted changes
 under refs/antidote/<ID>/, then writes and prints a recipe with the exact undo
@@ -105,6 +112,7 @@ remote_sha() {
 # prepare
 
 cmd_prepare() {
+  case " $* " in *" --op db "*|*" --op=db "*) cmd_prepare_db "$@"; return ;; esac
   local op=push target="" headrev=HEAD note="" fetch=1 bundle=0
   while [ $# -gt 0 ]; do
     case $1 in
@@ -394,15 +402,20 @@ recipe_rewind() {
 # verify / show / list / drop / prune
 
 cmd_verify() {
-  local id="" fetch=1
+  local id="" fetch=1 rehearse=0 scratch=""
   while [ $# -gt 0 ]; do
     case $1 in
       --no-fetch) fetch=0; shift ;;
+      --rehearse) rehearse=1; shift ;;
+      --rehearse-into)   need_val "$1" $#; rehearse=1; scratch=$2; shift 2 ;;
+      --rehearse-into=*) rehearse=1; scratch=${1#*=}; shift ;;
       -*) die "verify: unknown argument: $1" ;;
       *) id=$1; shift ;;
     esac
   done
   id=$(resolve_id "$id")
+  if [ "$(rec_get "$id" op)" = db ]; then verify_db "$id" "$rehearse" "$scratch"; return; fi
+  [ "$rehearse" = 0 ] || die "--rehearse is for database antidotes"
   local ok=1 key sha actual
   for key in head target worktree; do
     case $key in
@@ -483,7 +496,9 @@ cmd_list() {
 }
 
 drop_id() {
-  local id=$1 ref
+  local id=$1 ref backup
+  backup=$(rec_get "$id" backup)
+  if [ -n "$backup" ]; then rm -f "$backup"; fi
   for ref in $(git for-each-ref --format='%(refname)' "refs/antidote/$id/"); do
     git update-ref -d "$ref"
   done
@@ -518,6 +533,496 @@ cmd_prune() {
     dropped=$((dropped + 1))
   done
   info "pruned $dropped antidote(s), kept $keep"
+}
+
+# ---------------------------------------------------------------------------
+# databases (--op db)
+#
+# Built-in drivers: postgres, mysql (and MariaDB), sqlite. Anything else goes
+# through --dump-cmd / --restore-cmd / --verify-cmd. Credentials are never
+# written to the record or the recipe.
+
+# Quote for a shell command line, only when needed (keeps printed recipes readable).
+shquote() {
+  case $1 in
+    '' | *[!A-Za-z0-9_./:=@%+,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+lower()   { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+urldecode() { local s=$1; printf '%b' "${s//%/\\x}"; }
+need_tool() { command -v "$1" >/dev/null 2>&1 || die "$1 not found: install the $2 client tools, or use --dump-cmd/--restore-cmd"; }
+run_limited() { if command -v timeout >/dev/null 2>&1; then timeout 120 "$@"; else "$@"; fi; }
+human_size() {
+  awk -v b="$1" 'BEGIN { if (b < 1024) printf "%d B", b; else if (b < 1048576) printf "%.0f KB", b / 1024; else printf "%.1f MB", b / 1048576 }'
+}
+
+# Hide passwords in user:pass@ and ?password= forms.
+db_redact() {
+  printf '%s' "$1" | sed -E 's#(://[^:/@]*):[^@/]*@#\1:***@#; s#([?&](password|pass|pwd|sslpassword)=)[^&]*#\1***#g'
+}
+
+# Splits a database URL into DB_USER DB_PASS DB_HOST DB_PORT DB_NAME.
+parse_db_url() {
+  local re='^[A-Za-z0-9+.-]+://(([^:@/]*)(:([^@/]*))?@)?([^:/?]*)(:([0-9]+))?(/([^?]*))?'
+  DB_USER="" DB_PASS="" DB_HOST="" DB_PORT="" DB_NAME=""
+  [[ $1 =~ $re ]] || return 1
+  DB_USER=$(urldecode "${BASH_REMATCH[2]}")
+  DB_PASS=$(urldecode "${BASH_REMATCH[4]}")
+  DB_HOST=${BASH_REMATCH[5]}
+  DB_PORT=${BASH_REMATCH[7]}
+  DB_NAME=$(urldecode "${BASH_REMATCH[9]}")
+}
+
+sqlite_path() {
+  local p=$1
+  case $p in
+    sqlite:////*) p=/${p#sqlite:////} ;;
+    sqlite:///*)  p=${p#sqlite:///} ;;
+    sqlite://*)   p=${p#sqlite://} ;;
+    sqlite:*)     p=${p#sqlite:} ;;
+    file:*)       p=${p#file:} ;;
+  esac
+  printf '%s' "${p%%\?*}"
+}
+
+abs_path() {
+  local d
+  d=$(dirname "$1")
+  if [ -d "$d" ]; then d=$(cd "$d" && pwd -P); fi
+  printf '%s/%s' "$d" "$(basename "$1")"
+}
+
+# postgres | mysql | sqlite, or nothing if it cannot tell.
+db_engine() {
+  case $1 in
+    postgres://*|postgresql://*) echo postgres ;;
+    mysql://*|mariadb://*)       echo mysql ;;
+    sqlite:*|file:*)             echo sqlite ;;
+    *) if [ -f "$1" ] && [ "$(head -c 15 "$1" 2>/dev/null)" = "SQLite format 3" ]; then echo sqlite; fi ;;
+  esac
+}
+
+# A stable name for a database without credentials, e.g. postgres://db.example.com:5432/app.
+db_key() {
+  local engine=$1 db=$2 label=${3:-} host
+  case $engine in
+    postgres|mysql)
+      if ! parse_db_url "$db"; then printf '%s:%s' "$engine" "$(db_redact "$db")"; return; fi
+      host=$(lower "${DB_HOST:-localhost}")
+      case $host in 127.0.0.1|::1|\[::1\]) host=localhost ;; esac
+      if [ "$engine" = postgres ]; then
+        printf 'postgres://%s:%s/%s' "$host" "${DB_PORT:-5432}" "${DB_NAME:-$DB_USER}"
+      else
+        printf 'mysql://%s:%s/%s' "$host" "${DB_PORT:-3306}" "$DB_NAME"
+      fi ;;
+    sqlite) printf 'sqlite:%s' "$(abs_path "$(sqlite_path "$db")")" ;;
+    *)      printf 'custom:%s' "${label:-custom}" ;;
+  esac
+}
+
+sqlite_query() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+for r in c.execute(sys.argv[2]): print(*r, sep="|")' "$1" "$2"
+  else
+    need_tool sqlite3 SQLite
+    sqlite3 "$1" "$2"
+  fi
+}
+
+# MySQL client arguments for the URL in DB_* (no password: that goes in MYSQL_PWD).
+mysql_args() {
+  MYSQL_ARGS=()
+  if [ -n "$DB_HOST" ]; then MYSQL_ARGS+=(--protocol=TCP "--host=$DB_HOST"); fi
+  if [ -n "$DB_PORT" ]; then MYSQL_ARGS+=("--port=$DB_PORT"); fi
+  if [ -n "$DB_USER" ]; then MYSQL_ARGS+=("--user=$DB_USER"); fi
+}
+
+db_dump() {
+  local engine=$1 db=$2 file=$3 cmd=$4 path
+  case $engine in
+    postgres)
+      need_tool pg_dump PostgreSQL
+      pg_dump --format=custom --no-owner --file="$file" "$db" ;;
+    mysql)
+      need_tool mysqldump MySQL/MariaDB
+      parse_db_url "$db" || die "cannot parse the MySQL URL $(db_redact "$db")"
+      [ -n "$DB_NAME" ] || die "the MySQL URL has no database name"
+      mysql_args
+      MYSQL_PWD=$DB_PASS mysqldump ${MYSQL_ARGS[@]+"${MYSQL_ARGS[@]}"} \
+        --single-transaction --routines --triggers --result-file="$file" "$DB_NAME" ;;
+    sqlite)
+      path=$(sqlite_path "$db")
+      [ -f "$path" ] || die "no SQLite database at $path"
+      # The online backup API copies a consistent snapshot even while the database is in use.
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sqlite3, sys
+s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2])
+s.backup(d); d.close(); s.close()' "$path" "$file"
+      else
+        need_tool sqlite3 SQLite
+        sqlite3 "$path" ".backup $(shquote "$file")"
+      fi ;;
+    custom)
+      sh -c "${cmd//\{out\}/$(shquote "$file")}" ;;
+  esac
+}
+
+# Prints a one-line summary of the backup; fails if it is not restorable.
+db_check() {
+  local engine=$1 file=$2 cmd=$3 out n
+  case $engine in
+    postgres)
+      out=$(pg_restore --list "$file" 2>&1) || { printf 'pg_restore cannot read it: %s' "$out"; return 1; }
+      n=$(printf '%s\n' "$out" | grep -c ' TABLE DATA ' || true)
+      printf '%s tables with data, readable by pg_restore' "$n" ;;
+    mysql)
+      case $(tail -c 300 "$file") in
+        *'-- Dump completed'*) ;;
+        *) printf 'incomplete: no "-- Dump completed" line at the end'; return 1 ;;
+      esac
+      n=$(grep -c '^CREATE TABLE' "$file" || true)
+      printf '%s tables, dump completed' "$n" ;;
+    sqlite)
+      out=$(sqlite_query "$file" 'PRAGMA integrity_check' 2>&1) || { printf 'cannot open it: %s' "$out"; return 1; }
+      [ "$out" = ok ] || { printf 'integrity_check failed: %s' "$out"; return 1; }
+      n=$(sqlite_query "$file" "SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+      printf '%s tables, integrity_check ok' "$n" ;;
+    custom)
+      if [ -z "$cmd" ]; then printf 'not checked (no --verify-cmd)'; return 0; fi
+      out=$(sh -c "${cmd//\{file\}/$(shquote "$file")}" 2>&1) || { printf -- '--verify-cmd failed: %s' "$out"; return 1; }
+      printf 'checked by --verify-cmd' ;;
+  esac
+}
+
+# The commands that restore FILE into the database, one per line.
+db_restore_cmds() {
+  local engine=$1 db=$2 dbenv=$3 file=$4 cmd=$5 ref path pw
+  case $engine in
+    postgres)
+      if [ -n "$dbenv" ]; then ref="\"\$$dbenv\""; else ref=$(shquote "$(db_redact "$db")"); fi
+      printf 'pg_restore --clean --if-exists --no-owner --single-transaction --dbname=%s %s\n' "$ref" "$(shquote "$file")" ;;
+    mysql)
+      parse_db_url "$db"
+      mysql_args
+      if [ -n "$dbenv" ]; then pw="<password from \$$dbenv>"; else pw="***"; fi
+      printf 'MYSQL_PWD=%s mysql%s %s < %s\n' "$(shquote "$pw")" \
+        "$(for a in ${MYSQL_ARGS[@]+"${MYSQL_ARGS[@]}"}; do printf ' %s' "$(shquote "$a")"; done)" \
+        "$(shquote "$DB_NAME")" "$(shquote "$file")" ;;
+    sqlite)
+      path=$(abs_path "$(sqlite_path "$db")")
+      printf 'rm -f %s %s\n' "$(shquote "$path-wal")" "$(shquote "$path-shm")"
+      printf 'cp %s %s\n' "$(shquote "$file")" "$(shquote "$path")" ;;
+    custom)
+      printf '%s\n' "${cmd//\{file\}/$(shquote "$file")}" ;;
+  esac
+}
+
+# Where the project's migrations stand, as lines of: tool<TAB>state<TAB>cure.
+# Best effort; runs in a subshell from cmd_prepare_db.
+detect_migrations() {
+  local db=$1 root out cur py
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  cd "$root" || return 0
+  export DATABASE_URL="${DATABASE_URL:-$db}"
+  if [ -f alembic.ini ] && command -v alembic >/dev/null 2>&1; then
+    if out=$(run_limited alembic current 2>/dev/null); then
+      cur=$(printf '%s\n' "$out" | awk '/^[0-9a-f]+/ { print $1; exit }')
+      printf 'alembic\t%s\talembic downgrade %s\n' "${cur:-base}" "${cur:-base}"
+    else
+      printf 'alembic\tunknown\t# could not run "alembic current": note the revision before migrating\n'
+    fi
+  fi
+  if [ -x bin/rails ]; then
+    cur=""
+    if out=$(run_limited bin/rails db:version 2>/dev/null); then
+      cur=$(printf '%s\n' "$out" | sed -n 's/.*[Vv]ersion: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+    fi
+    if [ -n "$cur" ]; then
+      printf 'rails\t%s\tbin/rails db:migrate VERSION=%s\n' "$cur" "$cur"
+    else
+      printf 'rails\tunknown\t# could not run "bin/rails db:version": note the version before migrating\n'
+    fi
+  fi
+  if [ -f manage.py ]; then
+    py=$(command -v python3 || command -v python || true)
+    if [ -n "$py" ] && out=$(run_limited "$py" manage.py showmigrations --plan 2>/dev/null); then
+      printf '%s\n' "$out" | awk -v py="$(basename "$py")" '
+        /^\[[ X]\] +[^ ]+\.[^ ]+/ {
+          applied = ($0 ~ /^\[X\]/)
+          ref = $2; if (ref == "]") ref = $3
+          if (ref ~ /^\]/) ref = substr(ref, 2)
+          app = substr(ref, 1, index(ref, ".") - 1); name = substr(ref, index(ref, ".") + 1)
+          if (!(app in seen)) { seen[app] = 1; order[++n] = app; last[app] = "zero" }
+          if (applied) last[app] = name
+        }
+        END { for (i = 1; i <= n; i++) printf "django\t%s.%s\t%s manage.py migrate %s %s\n", order[i], last[order[i]], py, order[i], last[order[i]] }'
+    else
+      printf 'django\tunknown\t# could not run "manage.py showmigrations": note the state before migrating\n'
+    fi
+  fi
+  if [ -f prisma/schema.prisma ]; then
+    printf 'prisma\tno down migrations\t# Prisma Migrate cannot migrate down: restore the backup, then run: npx prisma migrate resolve --rolled-back <migration_name>\n'
+  fi
+  if [ -x node_modules/.bin/knex ]; then
+    cur=""
+    if out=$(run_limited node_modules/.bin/knex migrate:currentVersion 2>/dev/null); then
+      cur=$(printf '%s\n' "$out" | sed -n 's/.*[Vv]ersion: *\([^ ]*\).*/\1/p' | head -n 1)
+    fi
+    printf 'knex\t%s\tnode_modules/.bin/knex migrate:rollback   # undoes the last batch; repeat until migrate:currentVersion is %s\n' "${cur:-unknown}" "${cur:-what it was}"
+  fi
+  if [ -f artisan ]; then
+    printf 'laravel\tunknown\tphp artisan migrate:rollback   # undoes the last batch\n'
+  fi
+}
+
+cmd_prepare_db() {
+  local db="" dbenv="" out="" note="" engine="" dumpcmd="" restorecmd="" verifycmd="" label="" migrations=1
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --op)          need_val "$1" $#; shift 2 ;;
+      --op=*)        shift ;;
+      --db)          need_val "$1" $#; db=$2; shift 2 ;;
+      --db=*)        db=${1#*=}; shift ;;
+      --db-env)      need_val "$1" $#; dbenv=$2; shift 2 ;;
+      --db-env=*)    dbenv=${1#*=}; shift ;;
+      --out)         need_val "$1" $#; out=$2; shift 2 ;;
+      --out=*)       out=${1#*=}; shift ;;
+      --note)        need_val "$1" $#; note=$2; shift 2 ;;
+      --note=*)      note=${1#*=}; shift ;;
+      --engine)      need_val "$1" $#; engine=$2; shift 2 ;;
+      --engine=*)    engine=${1#*=}; shift ;;
+      --name)        need_val "$1" $#; label=$2; shift 2 ;;
+      --name=*)      label=${1#*=}; shift ;;
+      --dump-cmd)    need_val "$1" $#; dumpcmd=$2; shift 2 ;;
+      --restore-cmd) need_val "$1" $#; restorecmd=$2; shift 2 ;;
+      --verify-cmd)  need_val "$1" $#; verifycmd=$2; shift 2 ;;
+      --no-migrations) migrations=0; shift ;;
+      -h|--help)     usage; return 0 ;;
+      *) die "prepare --op db: unknown argument: $1" ;;
+    esac
+  done
+  if [ -n "$dbenv" ]; then
+    [[ $dbenv =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "--db-env takes a variable name, like DATABASE_URL"
+    db=${!dbenv:-}
+    [ -n "$db" ] || die "\$$dbenv is empty or not set"
+  fi
+  if [ -n "$dumpcmd" ] && [ -z "$engine" ]; then engine=custom; fi
+  if [ -z "$engine" ]; then engine=$(db_engine "$db"); fi
+  case $engine in
+    postgres|mysql|sqlite) [ -n "$db" ] || die "--op db needs --db URL|FILE or --db-env VAR" ;;
+    custom)
+      [ -n "$dumpcmd" ] || die "--engine custom needs --dump-cmd"
+      [ -n "$restorecmd" ] || die "--dump-cmd needs a --restore-cmd too: a backup nobody knows how to restore is not an antidote" ;;
+    '') die "cannot tell what database '$(db_redact "$db")' is: pass --engine postgres|mysql|sqlite, or --dump-cmd/--restore-cmd for anything else" ;;
+    *)  die "unknown --engine '$engine' (postgres, mysql, sqlite, or custom with --dump-cmd/--restore-cmd)" ;;
+  esac
+
+  local base id n=1 dir file key check size
+  base="$(date -u +%Y%m%d-%H%M%S)-$engine"
+  id=$base
+  while [ -e "$(rec_file "$id")" ]; do n=$((n + 1)); id="$base-$n"; done
+  mkdir -p "$STORE"
+  dir=${out:-$(git config --get antidote.dbBackupDir || true)}
+  dir=${dir:-$STORE/db}
+  mkdir -p "$dir" || die "cannot create $dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  dir=$(cd "$dir" && pwd -P)
+  case $engine in
+    postgres) file="$dir/$id.dump" ;;
+    mysql)    file="$dir/$id.sql" ;;
+    sqlite)   file="$dir/$id.sqlite3" ;;
+    custom)   file="$dir/$id.backup" ;;
+  esac
+  key=$(db_key "$engine" "$db" "$label")
+
+  info "backing up $key ..."
+  if ! (umask 077 && db_dump "$engine" "$db" "$file" "$dumpcmd"); then
+    rm -f "$file"
+    die "the backup failed, so there is no antidote yet: do not make the change until this works"
+  fi
+  [ -s "$file" ] || { rm -f "$file"; die "the backup is empty, so there is no antidote yet"; }
+  chmod 600 "$file" 2>/dev/null || true
+  check=$(db_check "$engine" "$file" "$verifycmd") || { rm -f "$file"; die "the backup does not verify ($check), so there is no antidote yet"; }
+  size=$(wc -c < "$file" | tr -d ' ')
+
+  rec_set "$id" id "$id"
+  rec_set "$id" op db
+  rec_set "$id" kind db
+  rec_set "$id" created "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  rec_set "$id" createdepoch "$(date +%s)"
+  rec_set "$id" repo "$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  rec_set "$id" engine "$engine"
+  rec_set "$id" target "$key"
+  rec_set "$id" dbkey "$key"
+  rec_set "$id" dbenv "$dbenv"
+  rec_set "$id" backup "$file"
+  rec_set "$id" size "$size"
+  rec_set "$id" check "$check"
+  rec_set "$id" verifycmd "$verifycmd"
+  rec_set "$id" note "$note"
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] && git config -f "$(rec_file "$id")" --add antidote.restore "$line"
+  done <<< "$(db_restore_cmds "$engine" "$db" "$dbenv" "$file" "$restorecmd")"
+  if [ "$migrations" = 1 ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && git config -f "$(rec_file "$id")" --add antidote.migration "$line"
+    done <<< "$(detect_migrations "$db" 2>/dev/null || true)"
+  fi
+
+  render_db_recipe "$id" > "$STORE/$id.md"
+  cat "$STORE/$id.md"
+  info "antidote $id ready (recipe saved to $STORE/$id.md)"
+}
+
+render_db_recipe() {
+  local id=$1 engine target created repo note backup size check dbenv line tool state cure
+  engine=$(rec_get "$id" engine)
+  target=$(rec_get "$id" target)
+  created=$(rec_get "$id" created)
+  repo=$(rec_get "$id" repo)
+  note=$(rec_get "$id" note)
+  backup=$(rec_get "$id" backup)
+  size=$(rec_get "$id" size)
+  check=$(rec_get "$id" check)
+  dbenv=$(rec_get "$id" dbenv)
+  local migs restores
+  migs=$(git config -f "$(rec_file "$id")" --get-all antidote.migration 2>/dev/null || true)
+  restores=$(git config -f "$(rec_file "$id")" --get-all antidote.restore 2>/dev/null || true)
+
+  printf '# Antidote %s\n\n' "$id"
+  printf -- '- Operation: database change (%s)\n- Database: `%s`\n- Created: %s\n- Repository: %s\n' "$engine" "$target" "$created" "$repo"
+  if [ -n "$note" ]; then printf -- '- Note: %s\n' "$note"; fi
+
+  printf '\n## Snapshot\n\n| What | Where | Check |\n|---|---|---|\n'
+  printf '| Database backup | `%s` (%s) | %s |\n' "$backup" "$(human_size "${size:-0}")" "$check"
+  if [ -n "$migs" ]; then
+    while IFS="$(printf '\t')" read -r tool state cure; do
+      printf '| Migrations (%s) | at `%s` | |\n' "$tool" "$state"
+    done <<< "$migs"
+  fi
+  printf '\n> The backup holds real data and is readable only by you. Delete it with `%s drop %s` once you no longer need it.\n' "$PROG" "$id"
+  if [ -z "$dbenv" ] && { [ "$engine" = postgres ] || [ "$engine" = mysql ]; }; then
+    printf '> Credentials are not stored: where a command shows `***`, put the real password back (or prepare with `--db-env VAR` next time).\n'
+  fi
+
+  printf '\n## Cure\n'
+  if [ -n "$migs" ]; then
+    printf '\n### Option A: step the migrations back (keeps data written since the backup)\n\n'
+    while IFS="$(printf '\t')" read -r tool state cure; do printf '    %s\n' "$cure"; done <<< "$migs"
+    printf '\n### Option B: restore the backup (brings back dropped or changed data; anything written after the backup is lost)\n\n'
+  else
+    printf '\n### Restore the backup (anything written after the backup is lost)\n\n'
+  fi
+  if [ "$engine" = sqlite ]; then printf 'Stop everything that has the database open, then:\n\n'; fi
+  while IFS= read -r line; do printf '    %s\n' "$line"; done <<< "$restores"
+  case $engine in
+    postgres) printf '\nThe restore runs in one transaction, so if anything fails nothing changes. Objects created after\nthe backup (new tables, for example) are left in place: drop them by hand if they should go.\n' ;;
+    mysql)    printf '\nThe dump drops and recreates every table it contains. Tables created after the backup are left in place.\n' ;;
+  esac
+
+  printf '\n## Check that the antidote is still good\n\n    %s verify %s\n' "$PROG" "$id"
+  case $engine in
+    postgres|mysql) printf '    %s verify %s --rehearse-into <URL of an empty scratch database>   # prove the restore works\n' "$PROG" "$id" ;;
+    sqlite)         printf '    %s verify %s --rehearse   # restore into a temporary copy\n' "$PROG" "$id" ;;
+  esac
+}
+
+verify_db() {
+  local id=$1 rehearse=$2 scratch=$3 ok=1 engine backup size actual check age
+  engine=$(rec_get "$id" engine)
+  backup=$(rec_get "$id" backup)
+  size=$(rec_get "$id" size)
+  if [ ! -f "$backup" ]; then
+    printf 'FAIL  backup %s is missing\n' "$backup"
+    printf 'antidote %s is NOT usable\n' "$id"
+    return 1
+  fi
+  actual=$(wc -c < "$backup" | tr -d ' ')
+  if [ "$actual" != "$size" ]; then
+    printf 'FAIL  backup is %s bytes, expected %s: it changed since it was taken\n' "$actual" "$size"; ok=0
+  elif check=$(db_check "$engine" "$backup" "$(rec_get "$id" verifycmd)"); then
+    printf 'OK    backup   %s (%s)\n' "$backup" "$check"
+  else
+    printf 'FAIL  backup   %s\n' "$check"; ok=0
+  fi
+  age=$(( $(date +%s) - $(rec_get "$id" createdepoch) ))
+  printf 'INFO  taken %s min ago: anything written since is not in it\n' "$((age / 60))"
+
+  if [ "$ok" = 1 ] && [ "$rehearse" = 1 ]; then
+    if rehearse_db "$id" "$engine" "$backup" "$scratch"; then :; else ok=0; fi
+  fi
+  if [ "$ok" = 1 ]; then printf 'antidote %s is ready\n' "$id"; else printf 'antidote %s is NOT usable\n' "$id"; return 1; fi
+}
+
+rehearse_db() {
+  local id=$1 engine=$2 backup=$3 scratch=$4 out n tmp
+  case $engine in
+    postgres|mysql)
+      [ -n "$scratch" ] || die "--rehearse-into needs the URL of an empty scratch database"
+      [ "$(db_engine "$scratch")" = "$engine" ] || die "the scratch database must be $engine too"
+      if [ "$(db_key "$engine" "$scratch")" = "$(rec_get "$id" dbkey)" ]; then
+        die "refusing to rehearse into the database this antidote protects; use an empty scratch database"
+      fi ;;
+  esac
+  case $engine in
+    postgres)
+      if out=$(pg_restore --no-owner --exit-on-error --dbname="$scratch" "$backup" 2>&1); then
+        n=$(psql "$scratch" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema')")
+        printf 'OK    rehearsal: restored into %s (%s tables)\n' "$(db_redact "$scratch")" "$n"
+      else
+        printf 'FAIL  rehearsal: pg_restore into %s failed: %s\n' "$(db_redact "$scratch")" "$out"; return 1
+      fi ;;
+    mysql)
+      parse_db_url "$scratch"; mysql_args
+      if out=$(MYSQL_PWD=$DB_PASS mysql ${MYSQL_ARGS[@]+"${MYSQL_ARGS[@]}"} "$DB_NAME" < "$backup" 2>&1); then
+        n=$(MYSQL_PWD=$DB_PASS mysql ${MYSQL_ARGS[@]+"${MYSQL_ARGS[@]}"} -N -e "SELECT count(*) FROM information_schema.tables WHERE table_schema = '$DB_NAME'")
+        printf 'OK    rehearsal: restored into %s (%s tables)\n' "$(db_redact "$scratch")" "$n"
+      else
+        printf 'FAIL  rehearsal: restore into %s failed: %s\n' "$(db_redact "$scratch")" "$out"; return 1
+      fi ;;
+    sqlite)
+      tmp=$(mktemp)
+      cp "$backup" "$tmp"
+      if out=$(sqlite_query "$tmp" 'PRAGMA integrity_check' 2>&1) && [ "$out" = ok ]; then
+        n=$(sqlite_query "$tmp" "SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+        printf 'OK    rehearsal: restored into a temporary copy (%s tables)\n' "$n"
+        rm -f "$tmp"
+      else
+        printf 'FAIL  rehearsal: %s\n' "$out"; rm -f "$tmp"; return 1
+      fi ;;
+    custom)
+      die "rehearsal is not supported for --dump-cmd backups: restore into a scratch target by hand" ;;
+  esac
+}
+
+# Is there a fresh database antidote (for the database in VAR, if given)?
+covers_db() {
+  local key=$1 maxage id now age
+  maxage=$(git config --get antidote.dbMaxAge || true)
+  maxage=${maxage:-3600}
+  now=$(date +%s)
+  for id in $(list_ids | sort -r); do
+    [ "$(rec_get "$id" op)" = db ] || continue
+    if [ -n "$key" ] && [ "$(rec_get "$id" dbkey)" != "$key" ]; then continue; fi
+    age=$((now - $(rec_get "$id" createdepoch)))
+    if [ "$age" -gt "$maxage" ]; then
+      printf '%s: antidote %s is stale: its backup is %s min old (limit: antidote.dbMaxAge = %ss)\n' \
+        "$PROG" "$id" "$((age / 60))" "$maxage" >&2
+      return 1
+    fi
+    if [ ! -s "$(rec_get "$id" backup)" ]; then
+      printf '%s: antidote %s has lost its backup file\n' "$PROG" "$id" >&2
+      return 1
+    fi
+    printf '%s\n' "$id"
+    return 0
+  done
+  printf '%s: no database antidote%s\n' "$PROG" "${key:+ for $key}" >&2
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -617,9 +1122,10 @@ cmd_guard() {
 # operations that never pass through a local pre-push hook, like server-side
 # PR merges. Fresh means the remote target has not moved since it was prepared.
 cmd_covers() {
-  local op="" b="" fetch=1
+  local op="" b="" fetch=1 dbenv=""
   while [ $# -gt 0 ]; do
     case $1 in
+      --db-env)   need_val "$1" $#; dbenv=$2; shift 2 ;;
       --op)       need_val "$1" $#; op=$2; shift 2 ;;
       --op=*)     op=${1#*=}; shift ;;
       --branch)   need_val "$1" $#; b=$2; shift 2 ;;
@@ -629,6 +1135,12 @@ cmd_covers() {
     esac
   done
   [ -n "$op" ] || die "covers needs --op"
+  if [ "$op" = db ]; then
+    local url="" engine
+    if [ -n "$dbenv" ]; then url=${!dbenv:-}; fi
+    if [ -n "$url" ]; then engine=$(db_engine "$url"); covers_db "$(db_key "$engine" "$url")"; else covers_db ""; fi
+    return
+  fi
   local id remote tb tsha now
   for id in $(list_ids | sort -r); do
     [ "$(rec_get "$id" op)" = "$op" ] || continue

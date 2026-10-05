@@ -31,6 +31,14 @@ shellcheck skills/antidote/scripts/antidote tests/test_antidote.sh ci/check-anti
 bash tests/test_antidote.sh            # or: bash tests/test_antidote.sh test_name ...
 ```
 
+Postgres and MySQL tests skip unless you point them at a server (they create and
+drop their own databases); CI runs them against service containers:
+
+```bash
+export ANTIDOTE_TEST_PG_URL=postgresql://postgres:pw@127.0.0.1:5432
+export ANTIDOTE_TEST_MYSQL_URL=mysql://root:pw@127.0.0.1:3306
+```
+
 - Every cure the helper prints must be covered by a test that actually runs it
   and checks the result. A cure nobody has run is not an antidote.
 - Keep the script portable: bash 3.2 (macOS) and git 2.23+, no other tools

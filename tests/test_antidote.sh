@@ -8,9 +8,11 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 ANTIDOTE="$ROOT/skills/antidote/scripts/antidote"
 PASS=0
 FAIL=0
+SKIP=0
 
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+unset DATABASE_URL PGHOST
 export GIT_CONFIG_NOSYSTEM=1 HOME=/nonexistent-antidote-home
 
 setup() {
@@ -50,7 +52,9 @@ run() {
   ( set -ex; "$name" ) > "$WORK/log" 2>&1
   local rc=$?
   set -e
-  if [ "$rc" = 0 ]; then
+  if [ "$rc" = 0 ] && [ -f "$WORK/skipped" ]; then
+    SKIP=$((SKIP + 1)); printf 'skip %s (%s)\n' "$name" "$(cat "$WORK/skipped")"
+  elif [ "$rc" = 0 ]; then
     PASS=$((PASS + 1)); printf 'ok   %s\n' "$name"
   else
     FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$name"; sed 's/^/     /' "$WORK/log"
@@ -326,6 +330,193 @@ test_pr_check() {
   [ "$(check_pr main $'## Antidote\r\n**Risk:** risky, cure is git revert abc1234\r\n')" = pass ]  # CRLF bodies
 }
 
+# --- database antidotes (--op db) ------------------------------------------
+#
+# Postgres and MySQL tests need a server: set ANTIDOTE_TEST_PG_URL and/or
+# ANTIDOTE_TEST_MYSQL_URL to an admin URL without a database name, e.g.
+#   postgresql://postgres:pw@127.0.0.1:5432   mysql://root:pw@127.0.0.1:3306
+# Each test creates and drops its own database.
+
+skip() { echo "$*" > "$WORK/skipped"; exit 0; }
+
+sqlite_db() {  # sqlite_db FILE: users(2 rows) + legacy(3 rows)
+  python3 - "$1" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""
+create table users (id integer primary key, email text);
+insert into users (email) values ('a@x.io'), ('b@x.io');
+create table legacy (id integer);
+insert into legacy values (1), (2), (3);
+""")
+c.commit()
+PY
+}
+sq() { python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])' "$1" "$2"; }
+
+# The indented lines of the recipe's restore section.
+restore_cmds() {
+  awk '/^### (Option B: )?[Rr]estore the backup/ { on = 1; next } /^#/ { on = 0 } on && /^    / { sub(/^    /, ""); print }' "$1"
+}
+
+test_db_sqlite_cure() {
+  sqlite_db app.db
+  "$ANTIDOTE" prepare --op db --db app.db --note "drop legacy" > recipe.md 2>/dev/null
+  grep "2 tables, integrity_check ok" recipe.md >/dev/null
+  python3 -c 'import sqlite3; c = sqlite3.connect("app.db"); c.execute("drop table legacy"); c.execute("delete from users where id = 2"); c.commit()'
+  restore_cmds recipe.md > cure.sh
+  bash -e cure.sh
+  [ "$(sq app.db 'select count(*) from users')" = 2 ]
+  [ "$(sq app.db 'select count(*) from legacy')" = 3 ]
+}
+
+test_db_backup_is_private_and_dropped_with_antidote() {
+  sqlite_db app.db
+  "$ANTIDOTE" prepare --op db --db app.db > /dev/null 2>&1
+  local f; f=$(ls .git/antidote/db/*.sqlite3)
+  [ -n "$(find "$f" -perm 0600)" ]
+  [ -n "$(find .git/antidote/db -maxdepth 0 -perm 0700)" ]
+  "$ANTIDOTE" drop "$("$ANTIDOTE" list 2>/dev/null | awk 'NR==2 {print $1}')" 2>/dev/null
+  [ ! -e "$f" ]
+}
+
+test_db_verify_rehearse_and_tamper() {
+  sqlite_db app.db
+  "$ANTIDOTE" prepare --op db --db app.db > /dev/null 2>&1
+  "$ANTIDOTE" verify --rehearse | grep "OK    rehearsal: restored into a temporary copy (2 tables)" >/dev/null
+  printf 'junk' >> .git/antidote/db/*.sqlite3
+  refute "$ANTIDOTE" verify >/dev/null
+}
+
+test_db_custom_engine() {
+  echo '{"users": 2}' > data.json
+  refute "$ANTIDOTE" prepare --op db --dump-cmd 'cp data.json {out}' 2>/dev/null   # no way back: refused
+  refute "$ANTIDOTE" prepare --op db --name store --dump-cmd 'cp data.json {out}' \
+    --restore-cmd 'cp {file} data.json' --verify-cmd 'grep -q nothing-like-this {file}' 2>/dev/null
+  [ -z "$("$ANTIDOTE" list 2>/dev/null)" ]                                          # failed check leaves nothing behind
+  [ -z "$(ls .git/antidote/db 2>/dev/null)" ]
+  "$ANTIDOTE" prepare --op db --name store --dump-cmd 'cp data.json {out}' \
+    --restore-cmd 'cp {file} data.json' --verify-cmd 'grep -q users {file}' > recipe.md 2>/dev/null
+  grep "checked by --verify-cmd" recipe.md >/dev/null
+  echo '{}' > data.json
+  restore_cmds recipe.md > cure.sh
+  bash -e cure.sh
+  grep '"users": 2' data.json >/dev/null
+}
+
+test_db_refuses_without_a_backup() {
+  refute "$ANTIDOTE" prepare --op db --db 'redis://localhost:6379' 2>/dev/null
+  refute "$ANTIDOTE" prepare --op db --db-env ANTIDOTE_NOT_SET 2>/dev/null
+  refute "$ANTIDOTE" prepare --op db --db missing.db 2>/dev/null
+  refute "$ANTIDOTE" prepare --op db --db 'postgresql://nobody@127.0.0.1:1/nope' 2>err.txt
+  grep "there is no antidote yet" err.txt >/dev/null
+  [ -z "$("$ANTIDOTE" list 2>/dev/null)" ]
+  [ -z "$(ls .git/antidote/db 2>/dev/null)" ]
+}
+
+test_db_migration_state_detected() {
+  sqlite_db app.db
+  mkdir -p "$WORK/bin" bin prisma
+  printf '#!/bin/sh\necho "abc123def (head)"\n' > "$WORK/bin/alembic"; chmod +x "$WORK/bin/alembic"
+  touch alembic.ini prisma/schema.prisma
+  printf '#!/bin/sh\necho "Current version: 20240101000000"\n' > bin/rails; chmod +x bin/rails
+  cat > manage.py <<'PY'
+print("[X]  shop.0001_initial\n[X]  shop.0002_add_price\n[ ]  shop.0003_drop_legacy\n[ ]  audit.0001_initial")
+PY
+  PATH="$WORK/bin:$PATH" "$ANTIDOTE" prepare --op db --db app.db > recipe.md 2>/dev/null
+  grep '^    alembic downgrade abc123def$' recipe.md >/dev/null
+  grep '^    bin/rails db:migrate VERSION=20240101000000$' recipe.md >/dev/null
+  grep '^    python3 manage.py migrate shop 0002_add_price$' recipe.md >/dev/null
+  grep '^    python3 manage.py migrate audit zero$' recipe.md >/dev/null
+  grep 'prisma migrate resolve --rolled-back' recipe.md >/dev/null
+  grep '^### Option A: step the migrations back' recipe.md >/dev/null
+  PATH="$WORK/bin:$PATH" "$ANTIDOTE" prepare --op db --db app.db --no-migrations > plain.md 2>/dev/null
+  refute grep 'Option A' plain.md
+}
+
+test_db_covers_freshness_and_target() {
+  sqlite_db app.db; sqlite_db other.db
+  refute "$ANTIDOTE" covers --op db 2>/dev/null
+  "$ANTIDOTE" prepare --op db --db app.db > /dev/null 2>&1
+  "$ANTIDOTE" covers --op db >/dev/null 2>&1
+  APP=app.db "$ANTIDOTE" covers --op db --db-env APP >/dev/null 2>&1
+  APP="sqlite:///app.db" "$ANTIDOTE" covers --op db --db-env APP >/dev/null 2>&1   # same file, URL form
+  OTHER=other.db refute "$ANTIDOTE" covers --op db --db-env OTHER 2>/dev/null
+  local rec; rec=$(ls .git/antidote/*.rec)
+  git config -f "$rec" antidote.createdepoch $(( $(date +%s) - 7200 ))
+  refute "$ANTIDOTE" covers --op db 2>err.txt
+  grep "is stale" err.txt >/dev/null
+  git config antidote.dbMaxAge 10800
+  "$ANTIDOTE" covers --op db >/dev/null 2>&1
+}
+
+pg_url() { [ -n "${ANTIDOTE_TEST_PG_URL:-}" ] || skip "ANTIDOTE_TEST_PG_URL not set"; printf '%s/%s' "${ANTIDOTE_TEST_PG_URL%/}" "$1"; }
+pg_db() {  # pg_db NAME: fresh database with users(2) + legacy(3); prints its URL
+  local url; url=$(pg_url "$1")
+  psql "$(pg_url postgres)" -q -c "DROP DATABASE IF EXISTS $1" -c "CREATE DATABASE $1" >/dev/null 2>&1
+  psql "$url" -q -c "CREATE TABLE users (id serial PRIMARY KEY, email text); INSERT INTO users (email) VALUES ('a@x.io'), ('b@x.io'); CREATE TABLE legacy (id int); INSERT INTO legacy VALUES (1), (2), (3);" >/dev/null
+  printf '%s' "$url"
+}
+pg_drop() { psql "$(pg_url postgres)" -q -c "DROP DATABASE IF EXISTS $1" >/dev/null 2>&1 || true; }
+
+test_db_postgres_cure() {
+  pg_url x >/dev/null
+  local name="antidote_t_$$"
+  DATABASE_URL=$(pg_db "$name"); export DATABASE_URL
+  "$ANTIDOTE" prepare --op db --db-env DATABASE_URL > recipe.md 2>/dev/null
+  grep '2 tables with data' recipe.md >/dev/null
+  # shellcheck disable=SC2016 # the recipe must reference the variable, not its value
+  grep -- '--dbname="$DATABASE_URL"' recipe.md >/dev/null
+  psql "$DATABASE_URL" -q -c "DROP TABLE legacy; DELETE FROM users WHERE id = 2; ALTER TABLE users ADD COLUMN age int;"
+  restore_cmds recipe.md > cure.sh
+  bash -e cure.sh 2>/dev/null
+  [ "$(psql "$DATABASE_URL" -tAc 'SELECT count(*) FROM users')" = 2 ]
+  [ "$(psql "$DATABASE_URL" -tAc 'SELECT count(*) FROM legacy')" = 3 ]
+  [ "$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'age'")" = 0 ]
+  pg_drop "$name"
+}
+
+test_db_postgres_never_stores_password() {
+  pg_url x >/dev/null
+  local name="antidote_t_$$" url pw
+  url=$(pg_db "$name")
+  pw=$(printf '%s' "$url" | sed -n 's#^[^:]*://[^:]*:\([^@]*\)@.*#\1#p')
+  [ -n "$pw" ] || skip "ANTIDOTE_TEST_PG_URL has no password to check"
+  "$ANTIDOTE" prepare --op db --db "$url" > recipe.md 2>/dev/null
+  refute grep -rF -- "$pw" recipe.md .git/antidote
+  grep -F ':***@' recipe.md >/dev/null
+  pg_drop "$name"
+}
+
+test_db_postgres_rehearse() {
+  pg_url x >/dev/null
+  local name="antidote_t_$$" scratch="antidote_s_$$" url
+  url=$(pg_db "$name")
+  psql "$(pg_url postgres)" -q -c "DROP DATABASE IF EXISTS $scratch" -c "CREATE DATABASE $scratch" >/dev/null 2>&1
+  "$ANTIDOTE" prepare --op db --db "$url" > /dev/null 2>&1
+  "$ANTIDOTE" verify --rehearse-into "$(pg_url "$scratch")" | grep 'OK    rehearsal: restored into .* (2 tables)' >/dev/null
+  refute "$ANTIDOTE" verify --rehearse-into "$url" 2>/dev/null                      # never into the protected db
+  pg_drop "$name"; pg_drop "$scratch"
+}
+
+test_db_mysql_cure() {
+  [ -n "${ANTIDOTE_TEST_MYSQL_URL:-}" ] || skip "ANTIDOTE_TEST_MYSQL_URL not set"
+  local base=${ANTIDOTE_TEST_MYSQL_URL%/} name="antidote_t_$$" pw
+  pw=$(printf '%s' "$base" | sed -n 's#^[^:]*://[^:]*:\([^@]*\)@.*#\1#p')
+  my() { MYSQL_PWD=$pw mysql --protocol=TCP -h "$(printf '%s' "$base" | sed 's#.*@##; s#:.*##')" \
+           -P "$(printf '%s' "$base" | sed 's#.*:##')" -u "$(printf '%s' "$base" | sed 's#^[^:]*://##; s#:.*##')" "$@"; }
+  my -e "DROP DATABASE IF EXISTS $name; CREATE DATABASE $name; USE $name; CREATE TABLE users (id int PRIMARY KEY, email text); INSERT INTO users VALUES (1, 'a@x.io'), (2, 'b@x.io'); CREATE TABLE legacy (id int); INSERT INTO legacy VALUES (1), (2), (3);"
+  "$ANTIDOTE" prepare --op db --db "$base/$name" > recipe.md 2>/dev/null
+  grep '2 tables, dump completed' recipe.md >/dev/null
+  [ -z "$pw" ] || refute grep -rF -- "$pw" recipe.md .git/antidote
+  my "$name" -e "DROP TABLE legacy; DELETE FROM users WHERE id = 2;"
+  restore_cmds recipe.md | PW=$pw awk '{ i = index($0, "MYSQL_PWD=\047***\047"); if (i) $0 = substr($0, 1, i - 1) "MYSQL_PWD=\"$PW\"" substr($0, i + 15); print }' > cure.sh
+  PW=$pw bash -e cure.sh
+  [ "$(my "$name" -N -e 'SELECT count(*) FROM users')" = 2 ]
+  [ "$(my "$name" -N -e 'SELECT count(*) FROM legacy')" = 3 ]
+  my -e "DROP DATABASE $name"
+}
+
 # --- Claude Code hook (hooks/antidote_guard.py) ------------------------------
 
 HOOK="$ROOT/hooks/antidote_guard.py"
@@ -424,6 +615,87 @@ test_hook_denies_tag_deletion() {
   [ -n "$(remote_tag v1.0)" ]
 }
 
+REMOTE_PG='postgresql://app:hunter2@db.prod.example.com:5432/app'
+
+test_hook_db_migrations_on_remote_db() {
+  local c
+  for c in 'alembic upgrade head' 'npx prisma migrate deploy' 'bundle exec rails db:migrate' \
+           'poetry run alembic upgrade head' 'python -m alembic upgrade head' 'python3 manage.py migrate' \
+           'npm run db:migrate' 'php artisan migrate --force' 'knex migrate:latest' 'flyway migrate' \
+           'goose up' 'mix ecto.migrate' 'sqlx migrate run'; do
+    [ "$(hook_bash "DATABASE_URL=$REMOTE_PG $c")" = deny ] || { echo "not denied: $c"; return 1; }
+  done
+  # Read-only migration commands stay allowed.
+  for c in 'alembic history' 'alembic current' 'rails db:version' 'npx prisma migrate status' \
+           'python3 manage.py showmigrations' 'knex migrate:status'; do
+    [ "$(hook_bash "DATABASE_URL=$REMOTE_PG $c")" = allow ] || { echo "not allowed: $c"; return 1; }
+  done
+}
+
+test_hook_db_message_is_actionable_and_redacted() {
+  local out
+  out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$PWD\",\"tool_input\":{\"command\":\"DATABASE_URL=$REMOTE_PG alembic upgrade head\"}}" | python3 "$HOOK")
+  printf '%s' "$out" | grep -- 'prepare --op db --db-env DATABASE_URL' >/dev/null
+  printf '%s' "$out" | grep -F 'app:***@db.prod.example.com' >/dev/null
+  refute grep hunter2 <<< "$out"
+}
+
+test_hook_db_local_and_unknown_targets_allowed() {
+  [ "$(hook_bash 'DATABASE_URL=postgresql://me@localhost/app alembic upgrade head')" = allow ]
+  [ "$(hook_bash 'DATABASE_URL=postgresql://me@127.0.0.1:5432/app alembic upgrade head')" = allow ]
+  [ "$(hook_bash 'alembic upgrade head')" = allow ]                     # cannot tell where: allowed
+  [ "$(hook_bash 'RAILS_ENV=production bin/rails db:migrate')" = deny ]  # but production is never local
+  git config --add antidote.dbLocalHost db.prod.example.com
+  [ "$(hook_bash "DATABASE_URL=$REMOTE_PG alembic upgrade head")" = allow ]
+}
+
+test_hook_db_reads_dotenv() {
+  printf 'DATABASE_URL="%s"\n' "$REMOTE_PG" > .env
+  [ "$(hook_bash 'alembic upgrade head')" = deny ]
+}
+
+test_hook_db_destructive_sql() {
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DROP TABLE users'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'TRUNCATE events'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DELETE FROM users'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'UPDATE users SET admin = true'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'ALTER TABLE users DROP COLUMN email'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DELETE FROM users WHERE id = 7'")" = allow ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'SELECT count(*) FROM users'")" = allow ]
+  [ "$(hook_bash "DATABASE_URL=$REMOTE_PG psql \"\$DATABASE_URL\" -c 'DROP TABLE users'")" = deny ]
+  [ "$(hook_bash "mysql -h db.prod.example.com -u app shop -e 'DROP TABLE orders'")" = deny ]
+  [ "$(hook_bash "mongosh mongodb://db.prod.example.com/app --eval 'db.dropDatabase()'")" = deny ]
+  echo 'TRUNCATE audit_log;' > wipe.sql
+  [ "$(hook_bash 'psql -h db.prod.example.com -d app -f wipe.sql')" = deny ]
+  [ "$(hook_bash 'psql -h db.prod.example.com app < wipe.sql')" = deny ]
+  [ "$(hook_bash "psql -d app -c 'DROP TABLE users'")" = allow ]       # local socket
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE users"')" = allow ]       # local file
+}
+
+test_hook_db_always_mode_and_antidote() {
+  sqlite_db app.db; sqlite_db other.db
+  git config antidote.dbGuard always
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE legacy"')" = deny ]
+  "$ANTIDOTE" prepare --op db --db app.db > /dev/null 2>&1
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE legacy"')" = allow ]
+  [ "$(hook_bash 'sqlite3 other.db "DROP TABLE legacy"')" = deny ]     # the antidote is for app.db only
+  git config antidote.dbGuard off
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DROP TABLE users'")" = allow ]
+}
+
+test_hook_db_postgres_antidote_unblocks() {
+  pg_url x >/dev/null
+  local name="antidote_h_$$"
+  DATABASE_URL=$(pg_db "$name"); export DATABASE_URL
+  git config antidote.dbGuard always                                   # the test server is local
+  [ "$(hook_bash 'alembic upgrade head')" = deny ]
+  "$ANTIDOTE" prepare --op db --db-env DATABASE_URL > /dev/null 2>&1
+  [ "$(hook_bash 'alembic upgrade head')" = allow ]
+  [ "$(hook_bash "psql \"\$DATABASE_URL\" -c 'DROP TABLE legacy'")" = allow ]
+  unset DATABASE_URL
+  pg_drop "$name"
+}
+
 test_hook_ignores_unparseable_and_other_tools() {
   [ "$(hook_bash 'echo "unbalanced')" = allow ]
   [ "$(hook_json '{"tool_name":"Read","tool_input":{"file_path":"x"}}')" = allow ]
@@ -439,5 +711,5 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [ $# -gt 0 ]; then tests="$*"; fi
 for t in $tests; do run "$t"; done
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" = 0 ]

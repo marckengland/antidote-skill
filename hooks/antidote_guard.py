@@ -11,6 +11,11 @@ Looks at Bash commands and PR-merge tool calls before they run:
   push``: these bypass the guard, so the user is asked to approve.
 * ``gh pr merge`` and MCP ``merge_pull_request`` tools: denied unless
   ``antidote covers --op merge`` finds a fresh merge antidote for the PR's base.
+* Database migrations (alembic, rails, django, prisma, knex, flyway, ...) and
+  destructive SQL (DROP, TRUNCATE, DELETE/UPDATE without WHERE) through psql,
+  mysql, sqlite3 or mongosh: denied on a non-local database unless
+  ``antidote covers --op db`` finds a fresh database antidote for it.
+  ``git config antidote.dbGuard always|remote|off`` (default remote).
 
 Anything it cannot understand is allowed: the git pre-push hook
 (``antidote install-hook``) is the backstop. Disable per repository with
@@ -133,6 +138,270 @@ def check_merge(selector, repo, cwd):
            % (r.stderr.strip(), ANTIDOTE, target, selector or ""))
 
 
+# --- databases --------------------------------------------------------------
+#
+# Migrations and destructive SQL against a database that is not local need a
+# fresh database antidote (antidote prepare --op db). Local databases (localhost,
+# sockets, SQLite files) are left alone unless antidote.dbGuard is "always".
+
+DB_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3", "mongosh", "mongo"}
+LAUNCHERS = {"npx", "bunx", "pnpx"}
+LAUNCHER_PAIRS = {
+    ("bundle", "exec"), ("poetry", "run"), ("uv", "run"), ("pipenv", "run"), ("pdm", "run"),
+    ("hatch", "run"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"), ("yarn", "exec"),
+    ("npm", "exec"), ("bun", "x"),
+}
+# Subcommands that change a schema or its data, per migration tool.
+MIGRATING = {
+    "alembic": {"upgrade", "downgrade", "stamp"},
+    "manage.py": {"migrate", "flush"},
+    "django-admin": {"migrate", "flush"},
+    "knex": {"migrate:latest", "migrate:up", "migrate:down", "migrate:rollback"},
+    "sequelize": {"db:migrate", "db:migrate:undo", "db:migrate:undo:all", "db:drop"},
+    "sequelize-cli": {"db:migrate", "db:migrate:undo", "db:migrate:undo:all", "db:drop"},
+    "typeorm": {"migration:run", "migration:revert", "schema:sync", "schema:drop"},
+    "flyway": {"migrate", "clean", "undo", "baseline", "repair"},
+    "liquibase": {"update", "rollback", "rollback-count", "rollbackCount", "drop-all", "dropAll"},
+    "migrate": {"up", "down", "drop", "force", "goto"},
+    "goose": {"up", "up-by-one", "up-to", "down", "down-to", "redo", "reset"},
+    "dbmate": {"up", "migrate", "rollback", "down", "drop"},
+    "mix": {"ecto.migrate", "ecto.rollback", "ecto.drop", "ecto.reset"},
+    "artisan": {"migrate", "migrate:fresh", "migrate:refresh", "migrate:reset", "migrate:rollback", "db:wipe"},
+    "drizzle-kit": {"push", "migrate", "drop"},
+}
+MIGRATING_PAIRS = {
+    "prisma": {("migrate", "deploy"), ("migrate", "reset"), ("migrate", "dev"), ("db", "push")},
+    "diesel": {("migration", "run"), ("migration", "revert"), ("migration", "redo"),
+               ("database", "reset"), ("database", "drop")},
+    "sqlx": {("migrate", "run"), ("migrate", "revert"), ("database", "drop"), ("database", "reset")},
+    "atlas": {("migrate", "apply"), ("schema", "apply"), ("schema", "clean")},
+    "supabase": {("db", "push"), ("db", "reset")},
+}
+RAILS_DB = re.compile(r"^db:(migrate(:\w+)?|rollback|schema:load|structure:load|reset|drop(:\w+)?"
+                      r"|setup|truncate_all|seed:replant)$")
+PROD_ENV_KEYS = ("RAILS_ENV", "RACK_ENV", "APP_ENV", "NODE_ENV", "MIX_ENV", "ENVIRONMENT", "ENV", "STAGE")
+DESTRUCTIVE = [
+    re.compile(r"\bDROP\s+(TABLE|DATABASE|SCHEMA|COLUMN|MATERIALIZED\s+VIEW)\b", re.I),
+    re.compile(r"\bTRUNCATE\b", re.I),
+    re.compile(r"\bALTER\s+TABLE\b[^;]*\bDROP\b", re.I),
+    re.compile(r"dropDatabase\s*\(|\.drop\s*\(\s*\)|\b(deleteMany|remove)\s*\(\s*\{\s*\}\s*\)"),
+]
+DB_URL = re.compile(r"^(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?)://", re.I)
+
+
+def git_config(cwd, key, all_values=False):
+    r = run(["git", "config", "--get-all" if all_values else "--get", key], cwd)
+    if not r or r.returncode != 0:
+        return [] if all_values else ""
+    return r.stdout.split() if all_values else r.stdout.strip()
+
+
+def expand(word, env):
+    return re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", lambda m: env.get(m.group(1), m.group(0)), word)
+
+
+def redact(url):
+    return re.sub(r"(://[^:/@]*):[^@/]*@", r"\1:***@", url)
+
+
+def unwrap(words):
+    """Drop launchers such as npx, bundle exec, poetry run and python -m."""
+    while words:
+        w0 = os.path.basename(words[0])
+        if w0 in LAUNCHERS:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
+        elif len(words) > 1 and (w0, words[1]) in LAUNCHER_PAIRS:
+            words = words[2:]
+        elif re.match(r"python[0-9.]*$", w0) and len(words) > 2 and words[1] == "-m":
+            words = words[2:]
+        else:
+            return words
+    return words
+
+
+def migration_tool(words):
+    """'<tool> <subcommand>' if WORDS runs a schema migration, else None."""
+    w = unwrap(words)
+    if not w:
+        return None
+    prog, args = os.path.basename(w[0]), w[1:]
+    if re.match(r"python[0-9.]*$", prog) and args and os.path.basename(args[0]) == "manage.py":
+        prog, args = "manage.py", args[1:]
+    if prog == "php" and args and os.path.basename(args[0]) == "artisan":
+        prog, args = "artisan", args[1:]
+    if prog in ("rails", "rake"):
+        hit = next((a for a in args if RAILS_DB.match(a)), None)
+        return "%s %s" % (prog, hit) if hit else None
+    if prog in MIGRATING:
+        hit = next((a for a in args if a in MIGRATING[prog]), None)
+        return "%s %s" % (prog, hit) if hit else None
+    if prog in MIGRATING_PAIRS:
+        for x, y in zip(args, args[1:]):
+            if (x, y) in MIGRATING_PAIRS[prog]:
+                return "%s %s %s" % (prog, x, y)
+        return None
+    # Package scripts and make targets named like migrations: npm run db:migrate, make migrate.
+    if prog in ("npm", "yarn", "pnpm", "bun", "make"):
+        rest = args[1:] if args[:1] == ["run"] else args
+        script = next((a for a in rest if not a.startswith("-")), "")
+        if re.search(r"migrat|^db:(push|reset|drop)", script):
+            return "%s %s" % (prog, script)
+    return None
+
+
+def dotenv_value(cwd, name):
+    for fname in (".env.local", ".env"):
+        try:
+            with open(os.path.join(cwd, fname)) as f:
+                for line in f:
+                    m = re.match(r"\s*(?:export\s+)?%s\s*=\s*(.*)$" % re.escape(name), line)
+                    if m:
+                        return m.group(1).strip().strip("'\"")
+        except OSError:
+            continue
+    return ""
+
+
+def migration_target(env, cwd):
+    """(url, env var name) of the database migrations would run against, if known."""
+    for name in git_config(cwd, "antidote.dbEnv", all_values=True) or ["DATABASE_URL"]:
+        url = env.get(name) or dotenv_value(cwd, name)
+        if url:
+            return url, name
+    return "", ""
+
+
+def host_of(url):
+    m = re.match(r"^[a-z0-9+.-]+://(?:[^@/]*@)?(\[[^\]]*\]|[^:/?,]*)", url, re.I)
+    return m.group(1) if m else ""
+
+
+def is_local(host, cwd):
+    host = (host or "").strip("[]").lower()
+    if host in ("", "localhost", "::1", "0.0.0.0") or host.startswith("127.") or host.startswith("/"):
+        return True
+    return host in [h.lower() for h in git_config(cwd, "antidote.dbLocalHost", all_values=True)]
+
+
+def client_target(prog, args, env):
+    """(url, host) a database client would connect to."""
+    if prog == "sqlite3":
+        path = next((a for a in args if not a.startswith("-")), "")
+        return path, "/"
+    url, host = "", None
+    for i, a in enumerate(args):
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        if DB_URL.match(a):
+            url = a
+        elif a in ("-h", "--host"):
+            host = nxt
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1]
+        elif a in ("-d", "--dbname") and DB_URL.match(nxt):
+            url = nxt
+        elif a.startswith("--dbname=") and DB_URL.match(a.split("=", 1)[1]):
+            url = a.split("=", 1)[1]
+        elif "host=" in a and "=" in a.split()[0]:  # libpq conninfo: "host=db.example.com dbname=app"
+            m = re.search(r"\bhost=(\S+)", a)
+            host = m.group(1) if m else host
+    if url:
+        return url, host_of(url)
+    if host is None and prog == "psql":
+        host = env.get("PGHOST", "")
+    return "", host or ""
+
+
+def sql_text(raw, args, cwd):
+    """The SQL a client command would run: the command line plus any -f / < files."""
+    text = [raw]
+    for i, a in enumerate(args):
+        path = ""
+        if a in ("-f", "--file", "<") and i + 1 < len(args):
+            path = args[i + 1]
+        elif a.startswith("--file="):
+            path = a.split("=", 1)[1]
+        elif a.startswith("<") and len(a) > 1:
+            path = a[1:]
+        if path:
+            try:
+                with open(os.path.join(cwd, path)) as f:
+                    text.append(f.read(1 << 20))
+            except OSError:
+                pass
+    return "\n".join(text)
+
+
+def destructive_sql(text):
+    for rx in DESTRUCTIVE:
+        m = rx.search(text)
+        if m:
+            return " ".join(m.group(0).split()[:3])
+    for stmt in text.split(";"):
+        m = re.search(r"\b(DELETE\s+FROM|UPDATE\s+[\w.\"`]+\s+SET)\b", stmt, re.I)
+        if m and not re.search(r"\bWHERE\b", stmt, re.I):
+            return "%s without WHERE" % " ".join(m.group(1).split()[:2]).upper()
+    return None
+
+
+def looks_like_db(words):
+    """Cheap pre-check, so ordinary commands never pay for git config lookups."""
+    w = unwrap(words)
+    return bool(w) and (os.path.basename(w[0]) in DB_CLIENTS or migration_tool(words) is not None)
+
+
+def check_db(words, env_prefix, raw, cwd):
+    mode = (git_config(cwd, "antidote.dbGuard") or "remote").lower()
+    if mode == "off":
+        return
+    env = dict(os.environ, **env_prefix)
+    words = [expand(w, env) for w in words]
+    tool = migration_tool(words)
+    w = unwrap(words)
+    prog = os.path.basename(w[0]) if w else ""
+    url, var, local = "", "", None
+    if tool:
+        what = "runs migrations (%s)" % tool
+        url, var = migration_target(env, cwd)
+        if url:
+            local = is_local(host_of(url), cwd)
+        if any(env.get(k, "").lower() in ("production", "prod", "staging") for k in PROD_ENV_KEYS):
+            local = False
+    elif prog in DB_CLIENTS:
+        hit = destructive_sql(sql_text(raw, w[1:], cwd))
+        if not hit:
+            return
+        what = "runs destructive SQL (%s)" % hit
+        url, host = client_target(prog, w[1:], env)
+        local = is_local(host, cwd)
+        for name, value in env.items():  # psql "$DATABASE_URL": suggest --db-env DATABASE_URL
+            if url and value == url and re.match(r"^[A-Z][A-Z0-9_]*$", name):
+                var = name
+                break
+    else:
+        return
+    if mode != "always" and local is not False:
+        return  # local, or we cannot tell where it goes
+    check_env = dict(os.environ, ANTIDOTE_HOOK_DB=url) if url else None
+    r = run([ANTIDOTE, "covers", "--op", "db"] + (["--db-env", "ANTIDOTE_HOOK_DB"] if url else []),
+            cwd, env=check_env)
+    if r is None or r.returncode == 0:
+        return
+    where = redact(url) if url else ("the database it targets")
+    if var:
+        how = "--db-env %s" % var
+    elif url:
+        how = "--db %s" % shlex.quote(redact(url))
+    else:
+        how = "--db <database URL>"
+    decide("deny",
+           "This command %s on %s, and there is no fresh database antidote for it. %s\n"
+           "Back the database up first (it checks the backup and prints the restore command), then retry:\n"
+           "  %s prepare --op db %s --note \"<what you are about to change>\""
+           % (what, where, (r.stderr or "").strip(), ANTIDOTE, how))
+
+
 def check_bash(command, cwd):
     try:
         segs = list(segments(command))
@@ -176,6 +445,8 @@ def check_bash(command, cwd):
                     selector = rest[j]
                 j += 1
             check_merge(selector, repo, cwd)
+        elif looks_like_db(words) and enabled(cwd):
+            check_db(words, env_prefix, command, cwd)
 
 
 def main():
