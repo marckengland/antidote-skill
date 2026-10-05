@@ -37,6 +37,11 @@ Use `scripts/antidote prepare --op <op>`; it writes these for you. For reference
 **Snapshot first, always,** even when a down migration exists. Down migrations
 cannot bring back dropped columns, tables or rows.
 
+`antidote prepare --op db --db-env DATABASE_URL` does the snapshot, the check
+and the cure for Postgres, MySQL/MariaDB and SQLite, and any other engine with
+`--dump-cmd/--restore-cmd`. The table below is what it runs, for when you need
+to do it by hand.
+
 | Engine | Snapshot | Restore | Test the backup |
 |---|---|---|---|
 | PostgreSQL | `pg_dump -Fc -f before.dump "$DATABASE_URL"` (or `-t table` for just the touched tables) | `pg_restore --clean --if-exists -d "$DATABASE_URL" before.dump` | `pg_restore --list before.dump \| head` |

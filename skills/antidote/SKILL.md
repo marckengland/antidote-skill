@@ -70,10 +70,35 @@ git update-ref refs/antidote/manual/main <that-sha>  # keep it alive locally
 git stash create                                      # prints a commit of uncommitted work, if any
 ```
 
+### Databases: use the helper too
+
+Before a migration, a bulk `UPDATE`/`DELETE`, or any `DROP`/`TRUNCATE`:
+
+```bash
+<skill-dir>/scripts/antidote prepare --op db --db-env DATABASE_URL --note "drop legacy_users"
+<skill-dir>/scripts/antidote prepare --op db --db app.db                    # a SQLite file
+<skill-dir>/scripts/antidote prepare --op db --name mongo \
+    --dump-cmd 'mongodump --uri "$MONGO_URL" --archive={out} --gzip' \
+    --restore-cmd 'mongorestore --uri "$MONGO_URL" --drop --archive={file} --gzip' \
+    --verify-cmd 'mongorestore --archive={file} --gzip --dryRun'          # any other engine
+```
+
+It backs the database up with its native tool (Postgres `pg_dump -Fc`, MySQL and
+MariaDB `mysqldump --single-transaction`, SQLite's online backup), checks the
+backup is restorable, records where the project's migrations stand (Alembic,
+Rails, Django, Knex; notes for Prisma and Laravel), and prints the cure: step
+the migrations back, or restore the backup. Prefer `--db-env VAR` over `--db URL`:
+credentials are never stored, and the cure then refers to `$VAR`.
+
+For a destructive change, also prove the restore works:
+`antidote verify --rehearse-into <URL of an empty scratch database>` (Postgres,
+MySQL) or `antidote verify --rehearse` (SQLite). It refuses to rehearse into the
+database it protects. If the backup fails, do not make the change.
+
 ### Everything else
 
-Databases, deploys, packages, infra, secrets and config each need their own
-antidote. Read [references/recipes.md](references/recipes.md) for the matching
+Deploys, packages, infra, secrets and config each need their own antidote, and
+so do databases the helper cannot reach. Read [references/recipes.md](references/recipes.md) for the matching
 section before you start.
 
 The antidote must not depend on the thing you are about to break: no backups
@@ -150,6 +175,7 @@ tag does not. Never bypass it (`ANTIDOTE_SKIP=1` or `--no-verify`)
 without the user's approval.
 
 When this skill is installed as a Claude Code plugin, a hook also checks
-`git push`, `gh pr merge` and MCP `merge_pull_request` calls before they run.
+`git push`, `gh pr merge` and MCP `merge_pull_request` calls, database
+migrations and destructive SQL against non-local databases before they run.
 If it denies one, do what its message says (prepare the antidote, then retry);
 do not try to get around it.

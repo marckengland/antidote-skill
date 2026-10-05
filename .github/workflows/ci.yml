@@ -27,3 +27,35 @@ jobs:
           python3 -m json.tool hooks/hooks.json > /dev/null
       - name: Tests
         run: bash tests/test_antidote.sh
+
+  databases:
+    # Database antidotes against real servers. Every printed cure is executed.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: s3cret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: my$ecret
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1" --health-interval 2s --health-timeout 5s --health-retries 60
+    env:
+      ANTIDOTE_TEST_PG_URL: postgresql://postgres:s3cret@127.0.0.1:5432
+      ANTIDOTE_TEST_MYSQL_URL: mysql://root:my$ecret@127.0.0.1:3306
+    steps:
+      - uses: actions/checkout@v5
+      - name: Database client tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-client-16 mysql-client sqlite3
+      - name: Tests (no database test may be skipped)
+        run: |
+          bash tests/test_antidote.sh | tee test-output.txt
+          if grep '^skip' test-output.txt; then echo "database tests were skipped"; exit 1; fi
