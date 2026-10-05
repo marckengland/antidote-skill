@@ -12,6 +12,7 @@ SKIP=0
 
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+unset DATABASE_URL PGHOST
 export GIT_CONFIG_NOSYSTEM=1 HOME=/nonexistent-antidote-home
 
 setup() {
@@ -612,6 +613,87 @@ test_hook_denies_tag_deletion() {
   [ "$(hook_bash 'git push origin :refs/tags/v1.0')" = deny ]
   [ "$(hook_bash 'git push origin --delete v1.0')" = deny ]
   [ -n "$(remote_tag v1.0)" ]
+}
+
+REMOTE_PG='postgresql://app:hunter2@db.prod.example.com:5432/app'
+
+test_hook_db_migrations_on_remote_db() {
+  local c
+  for c in 'alembic upgrade head' 'npx prisma migrate deploy' 'bundle exec rails db:migrate' \
+           'poetry run alembic upgrade head' 'python -m alembic upgrade head' 'python3 manage.py migrate' \
+           'npm run db:migrate' 'php artisan migrate --force' 'knex migrate:latest' 'flyway migrate' \
+           'goose up' 'mix ecto.migrate' 'sqlx migrate run'; do
+    [ "$(hook_bash "DATABASE_URL=$REMOTE_PG $c")" = deny ] || { echo "not denied: $c"; return 1; }
+  done
+  # Read-only migration commands stay allowed.
+  for c in 'alembic history' 'alembic current' 'rails db:version' 'npx prisma migrate status' \
+           'python3 manage.py showmigrations' 'knex migrate:status'; do
+    [ "$(hook_bash "DATABASE_URL=$REMOTE_PG $c")" = allow ] || { echo "not allowed: $c"; return 1; }
+  done
+}
+
+test_hook_db_message_is_actionable_and_redacted() {
+  local out
+  out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$PWD\",\"tool_input\":{\"command\":\"DATABASE_URL=$REMOTE_PG alembic upgrade head\"}}" | python3 "$HOOK")
+  printf '%s' "$out" | grep -- 'prepare --op db --db-env DATABASE_URL' >/dev/null
+  printf '%s' "$out" | grep -F 'app:***@db.prod.example.com' >/dev/null
+  refute grep hunter2 <<< "$out"
+}
+
+test_hook_db_local_and_unknown_targets_allowed() {
+  [ "$(hook_bash 'DATABASE_URL=postgresql://me@localhost/app alembic upgrade head')" = allow ]
+  [ "$(hook_bash 'DATABASE_URL=postgresql://me@127.0.0.1:5432/app alembic upgrade head')" = allow ]
+  [ "$(hook_bash 'alembic upgrade head')" = allow ]                     # cannot tell where: allowed
+  [ "$(hook_bash 'RAILS_ENV=production bin/rails db:migrate')" = deny ]  # but production is never local
+  git config --add antidote.dbLocalHost db.prod.example.com
+  [ "$(hook_bash "DATABASE_URL=$REMOTE_PG alembic upgrade head")" = allow ]
+}
+
+test_hook_db_reads_dotenv() {
+  printf 'DATABASE_URL="%s"\n' "$REMOTE_PG" > .env
+  [ "$(hook_bash 'alembic upgrade head')" = deny ]
+}
+
+test_hook_db_destructive_sql() {
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DROP TABLE users'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'TRUNCATE events'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DELETE FROM users'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'UPDATE users SET admin = true'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'ALTER TABLE users DROP COLUMN email'")" = deny ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DELETE FROM users WHERE id = 7'")" = allow ]
+  [ "$(hook_bash "psql $REMOTE_PG -c 'SELECT count(*) FROM users'")" = allow ]
+  [ "$(hook_bash "DATABASE_URL=$REMOTE_PG psql \"\$DATABASE_URL\" -c 'DROP TABLE users'")" = deny ]
+  [ "$(hook_bash "mysql -h db.prod.example.com -u app shop -e 'DROP TABLE orders'")" = deny ]
+  [ "$(hook_bash "mongosh mongodb://db.prod.example.com/app --eval 'db.dropDatabase()'")" = deny ]
+  echo 'TRUNCATE audit_log;' > wipe.sql
+  [ "$(hook_bash 'psql -h db.prod.example.com -d app -f wipe.sql')" = deny ]
+  [ "$(hook_bash 'psql -h db.prod.example.com app < wipe.sql')" = deny ]
+  [ "$(hook_bash "psql -d app -c 'DROP TABLE users'")" = allow ]       # local socket
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE users"')" = allow ]       # local file
+}
+
+test_hook_db_always_mode_and_antidote() {
+  sqlite_db app.db; sqlite_db other.db
+  git config antidote.dbGuard always
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE legacy"')" = deny ]
+  "$ANTIDOTE" prepare --op db --db app.db > /dev/null 2>&1
+  [ "$(hook_bash 'sqlite3 app.db "DROP TABLE legacy"')" = allow ]
+  [ "$(hook_bash 'sqlite3 other.db "DROP TABLE legacy"')" = deny ]     # the antidote is for app.db only
+  git config antidote.dbGuard off
+  [ "$(hook_bash "psql $REMOTE_PG -c 'DROP TABLE users'")" = allow ]
+}
+
+test_hook_db_postgres_antidote_unblocks() {
+  pg_url x >/dev/null
+  local name="antidote_h_$$"
+  DATABASE_URL=$(pg_db "$name"); export DATABASE_URL
+  git config antidote.dbGuard always                                   # the test server is local
+  [ "$(hook_bash 'alembic upgrade head')" = deny ]
+  "$ANTIDOTE" prepare --op db --db-env DATABASE_URL > /dev/null 2>&1
+  [ "$(hook_bash 'alembic upgrade head')" = allow ]
+  [ "$(hook_bash "psql \"\$DATABASE_URL\" -c 'DROP TABLE legacy'")" = allow ]
+  unset DATABASE_URL
+  pg_drop "$name"
 }
 
 test_hook_ignores_unparseable_and_other_tools() {
