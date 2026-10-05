@@ -170,7 +170,7 @@ jobs:
   antidote:
     runs-on: ubuntu-latest
     steps:
-      - uses: marckengland/antidote@main   # pin a release tag or commit SHA once you adopt it
+      - uses: marckengland/antidote-skill@main   # pin a release tag or commit SHA once you adopt it
         with:
           base-branches: "main release/*"  # default: main master trunk develop release/* production prod
           skip-label: no-antidote          # waive it for one PR
@@ -184,7 +184,7 @@ Pair it with a PR template containing an `## Antidote` section, like
 **Claude Code (plugin, recommended: skill + hook):**
 
 ```text
-/plugin marketplace add marckengland/antidote
+/plugin marketplace add marckengland/antidote-skill
 /plugin install antidote@antidote
 ```
 
@@ -192,8 +192,8 @@ Pair it with a PR template containing an `## Antidote` section, like
 (all projects) or `.claude/skills/` (one project):
 
 ```bash
-git clone https://github.com/marckengland/antidote
-cp -r antidote/skills/antidote ~/.claude/skills/
+git clone https://github.com/marckengland/antidote-skill
+cp -r antidote-skill/skills/antidote ~/.claude/skills/
 ```
 
 **Other agents:** any agent that supports the Agent Skills format (a folder with

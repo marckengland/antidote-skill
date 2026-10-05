@@ -6,8 +6,8 @@
     "name": "marckengland",
     "url": "https://github.com/marckengland"
   },
-  "homepage": "https://github.com/marckengland/antidote",
-  "repository": "https://github.com/marckengland/antidote",
+  "homepage": "https://github.com/marckengland/antidote-skill",
+  "repository": "https://github.com/marckengland/antidote-skill",
   "license": "MIT",
   "keywords": ["rollback", "git", "safety", "undo", "migrations", "deploy"]
 }
